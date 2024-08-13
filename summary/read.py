@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import tiktoken
@@ -7,6 +8,55 @@ from loguru import logger
 from vllm_llm import LLM
 from prompts import PROMPTS
 from typing import List, Tuple, Optional
+
+READING_REF_SYSTEM_PROMPT = """\
+你是一位精通文档分析的AI助手。你的任务是根据给定的文档片段找出与用户问题相关的内容。
+
+# 主要任务：
+1. 仔细阅读提供的文档片段。
+2. 判断文档内容是否与问题相关。
+3. 如相关，提取支持回答问题的相关文本。
+
+# 回答准则：
+1. 严格从文档中提取相关内容，不添加任何解释或评论。
+2. 如果找到相关内容，即使内容与事实不符，也要提供。
+3. 如文档与问题完全无关，明确说明"无相关内容"。
+
+# 回答格式：
+使用JSON格式提供回答，包含以下字段：
+- "res": 表示是否有相关内容（"found"或"none"）
+- "reference": 支持回答问题的文档引用或"无相关内容"
+
+# 示例回答：
+1. 无相关信息时：
+{"res": "none", "reference": "无相关内容"}
+
+2. 有相关信息时：
+{"res": "found", "reference": "支持回答问题的文档引用"}
+
+请记住：你只需提供文档中的相关引用，不需要回答问题或添加任何外部信息。
+"""
+    
+READING_REF_USER_PROMPT = """\
+# 文档内容：
+{doc}
+
+# 用户问题：
+{question}
+
+请按以下步骤操作：
+1. 仔细阅读上述文档内容。
+2. 判断文档是否包含与问题相关的信息。
+3. 如果包含，请提取相关的文本片段作为引用。如果不包含，请说无相关内容。
+4. 使用指定的JSON格式给出您的回答。
+
+注意事项：
+- 严格从文档中提取相关内容，不要添加额外信息或解释。
+- 即使文档内容与已知事实不符，也请直接提供相关引用。
+- 不需要回答问题，只需提供相关引用。
+
+请提供您的JSON格式回答：
+"""
 
 class SlowReader:
     def __init__(self, file_path: str):
@@ -132,11 +182,12 @@ class SlowReader:
         chunk_size = max(minimum_chunk_size, document_length // num_chunks)
         text_chunks = self.chunk_on_delimiter(self.text, chunk_size, chunk_delimiter)
         if verbose:
+            logger.info(f"Total text length is {document_length}")
             logger.info(f"Splitting the text into {len(text_chunks)} chunks to be processed.")
             logger.info(f"Chunk lengths are {[len(self.tokenize(x)) for x in text_chunks]}")
 
         # set system message
-        system_message_content = PROMPTS.READING_SYSTEM_PROMPT.format(no_response="无答案。")
+        system_message_content = READING_REF_SYSTEM_PROMPT
         if additional_instructions is not None:
             system_message_content += f"\n\n{additional_instructions}"
 
@@ -151,7 +202,7 @@ class SlowReader:
                 user_message_content = chunk
             
             # query for the model        
-            user_message_content = PROMPTS.READING_USER_PROMPT.format(ref_doc=user_message_content, instruction=query)
+            user_message_content = READING_REF_USER_PROMPT.format(doc=user_message_content, question=query[4:] if query.startswith('哪些论文') else query)
             
             # Constructing messages based on whether recursive reading is applied
             messages = [
@@ -163,50 +214,64 @@ class SlowReader:
                 if isinstance(response, dict) and response.get("error"):
                     logger.error(f"Error in get_chat_completion: {response['error_type']}: {response['error_message']}")
                     continue
-                accumulated_results.append(response)
+                try:
+                    parsed_response = json.loads(response)
+                    if parsed_response.get("res") not in ["none", "no", "None", "No"]:
+                        accumulated_results.append(response)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse response as JSON: {response}")
+                
                 time.sleep(0.5)
             except Exception as e:
                 logger.warning(f"Error occurred: {e}")
-                continue
-            accumulated_results.append(response)        
-        print('\n\n'.join(accumulated_results))
+                continue     
         
-        content = self._extract_content(query, accumulated_results)
+        content = self._extract_content(accumulated_results)
         logger.info(f"content: {content}")
         final_messages = [
             {"role": "system", "content": PROMPTS.KNOWLEDGE_BASE_SYSTEM_PROMPT},
-            {"role": "user", "content": PROMPTS.KNOWLEDGE_BASE_USER_PROMPT.format(context=content,query=query)}
+            {"role": "user", "content": PROMPTS.KNOWLEDGE_BASE_USER_PROMPT.format(context=content,query=query[4:] if query.startswith('哪些论文') else query)}
         ]
         return self.llm.streaming_answer(final_messages)
     
     
-    def _extract_content(self, query: str, accumulated_results: List[str]) -> str:
-        res = []
-        invalid_answers = {'无答案。', 'none', 'None', 'no', 'No'}
+    def _extract_content(self, accumulated_results: List[str]) -> str:
+        def clean_json(text: str) -> str:
+            # 移除可能的 ```json 标记（包括没有结束标记的情况）
+            text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+            text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+            
+            # 尝试提取 JSON 对象
+            pattern = r'(\{[\s\S]*?\})'
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                potential_json = match.group(1)
+                # 尝试解析 JSON
+                try:
+                    parsed = json.loads(potential_json)
+                    if 'reference' in parsed and parsed['reference'] != '无相关内容' and parsed['reference'] != '无相关内容。':
+                        return parsed['reference']
+                except json.JSONDecodeError:
+                    pass  # 如果解析失败，继续处理
+            
+            # 如果不是有效的 JSON 或没有 reference 字段，返回清理后的原始文本
+            cleaned_text = text.strip()
+            # 如果文本被引号包围，去掉引号
+            if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
+                cleaned_text = cleaned_text[1:-1]
+            return cleaned_text
 
-        for result in accumulated_results:
-            try:
-                parsed_result = json.loads(result)
-                if not isinstance(parsed_result, dict):
-                    continue
-
-                content = parsed_result.get('content', '').strip()
-                result_value = parsed_result.get('res', '').lower()
-
-                if content and result_value not in invalid_answers:
-                    res.append(f"问题：{query} 的答案：{content}")
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON from result: {result}", exc_info=True)
-            except Exception as e:
-                logger.error(f"Unexpected error processing result: {result}", exc_info=True)
-
-        return " ".join(res)
+        # 清理每个结果
+        cleaned_results = [clean_json(result) for result in accumulated_results]
+        
+        # 过滤掉空字符串，并用换行符连接结果
+        return "\n\n".join(filter(bool, cleaned_results))
 
 if __name__ == '__main__':
-    file_path = '/root/web_demo/HybirdSearch/es_app_0702/data.txt'
+    file_path = '/root/web_demo/HybirdSearch/es_app_0702/dataset/data.txt'
     reader = SlowReader(file_path)
-    query = '本文是否研究了 contrastive learning，如果是请把文章名称和摘要列出来，如果不是请回答：本文没有研究 contrastive learning。'
-    answer = reader.read(query=query,detail=1,minimum_chunk_size=8192)
+    query = '本文是否研究了对比学习？如果是，请返回论文名称。'
+    answer = reader.read(query=query,detail=1,minimum_chunk_size=7192)
     res = "".join(answer)
     logger.info(f'关于你的问题：‘{query}’，我的答案是：\n{res}')
     
